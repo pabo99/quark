@@ -1,0 +1,74 @@
+# golangci-lint configuration
+run:
+  timeout: 5m
+  tests: true
+  skip-dirs:
+    - vendor
+
+linters-settings:
+  gofmt:
+    simplify: true
+  goimports:
+    local-prefixes: github.com/omegaup/quark
+  govet:
+    check-shadowing: false
+  misspell:
+    locale: US
+  gocyclo:
+    min-complexity: 15
+  dupl:
+    threshold: 100
+  goconst:
+    min-len: 3
+    min-occurrences: 3
+  depguard:
+    rules:
+      main:
+        files:
+          - $all
+        allow:
+          - $gostd
+          - github.com/omegaup
+          - golang.org/x
+
+linters:
+  enable:
+    - gofmt
+    - goimports
+    - govet
+    - errcheck
+    - staticcheck
+    - unused
+    - gosimple
+    - structcheck
+    - varcheck
+    - ineffassign
+    - deadcode
+    - typecheck
+  disable:
+    - gosec     # Security checks might be too strict for this codebase
+    - lll       # Line length checks
+    - gochecknoinits # Allow init functions
+    - gochecknoglobals # Allow global variables
+
+issues:
+  exclude-use-default: false
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - errcheck
+        - dupl
+        - gosec
+    - path: "cmd/"
+      linters:
+        - gochecknoglobals
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+severity:
+  default-severity: error
+  case-sensitive: false
+  rules:
+    - linters:
+      - misspell
+      severity: warning
