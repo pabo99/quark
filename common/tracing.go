@@ -1,10 +1,13 @@
 package common
 
 import (
+	"context"
+	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"hash/fnv"
 	"io"
-	"math/rand"
+	mathrand "math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,7 +43,7 @@ var (
 )
 
 func init() {
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	r := mathrand.New(mathrand.NewSource(time.Now().UnixNano()))
 	syncID = uint64(r.Uint32())
 }
 
@@ -394,4 +397,288 @@ func (factory *EventFactory) Register(collector EventCollector) error {
 			Arg{"name", factory.threadName},
 		),
 	)
+}
+
+// === ENHANCED TRACING WITH REQUEST CORRELATION ===
+
+// TraceID represents a unique identifier for request tracing
+type TraceID string
+
+// SpanID represents a unique identifier for a span within a trace
+type SpanID string
+
+// GenerateTraceID creates a new unique trace ID
+func GenerateTraceID() TraceID {
+	bytes := make([]byte, 16)
+	rand.Read(bytes)
+	return TraceID(fmt.Sprintf("%x", bytes))
+}
+
+// GenerateSpanID creates a new unique span ID
+func GenerateSpanID() SpanID {
+	bytes := make([]byte, 8)
+	rand.Read(bytes)
+	return SpanID(fmt.Sprintf("%x", bytes))
+}
+
+// TracedEvent extends NormalEvent with trace correlation
+type TracedEvent struct {
+	NormalEvent
+	TraceID  TraceID `json:"trace_id"`
+	SpanID   SpanID  `json:"span_id"`
+	ParentID SpanID  `json:"parent_span_id,omitempty"`
+}
+
+// TracedCompleteEvent extends CompleteEvent with trace correlation
+type TracedCompleteEvent struct {
+	CompleteEvent
+	TraceID  TraceID `json:"trace_id"`
+	SpanID   SpanID  `json:"span_id"`
+	ParentID SpanID  `json:"parent_span_id,omitempty"`
+}
+
+// TraceContext holds correlation information for distributed tracing
+type TraceContext struct {
+	TraceID   TraceID           `json:"trace_id"`
+	SpanID    SpanID            `json:"span_id"`
+	ParentID  SpanID            `json:"parent_span_id,omitempty"`
+	Operation string            `json:"operation"`
+	StartTime time.Time         `json:"start_time"`
+	Tags      map[string]string `json:"tags"`
+	mu        sync.RWMutex      `json:"-"`
+}
+
+// NewTraceContext creates a new trace context
+func NewTraceContext(operation string) *TraceContext {
+	return &TraceContext{
+		TraceID:   GenerateTraceID(),
+		SpanID:    GenerateSpanID(),
+		Operation: operation,
+		StartTime: time.Now(),
+		Tags:      make(map[string]string),
+	}
+}
+
+// NewChildSpan creates a child span within the same trace
+func (tc *TraceContext) NewChildSpan(operation string) *TraceContext {
+	return &TraceContext{
+		TraceID:   tc.TraceID,
+		SpanID:    GenerateSpanID(),
+		ParentID:  tc.SpanID,
+		Operation: operation,
+		StartTime: time.Now(),
+		Tags:      make(map[string]string),
+	}
+}
+
+// AddTag adds a tag to the trace context (thread-safe)
+func (tc *TraceContext) AddTag(key, value string) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	if tc.Tags == nil {
+		tc.Tags = make(map[string]string)
+	}
+	tc.Tags[key] = value
+}
+
+// GetTag retrieves a tag from the trace context (thread-safe)
+func (tc *TraceContext) GetTag(key string) (string, bool) {
+	tc.mu.RLock()
+	defer tc.mu.RUnlock()
+	value, exists := tc.Tags[key]
+	return value, exists
+}
+
+// LogFields returns structured log fields with trace correlation
+func (tc *TraceContext) LogFields() map[string]interface{} {
+	tc.mu.RLock()
+	defer tc.mu.RUnlock()
+	
+	fields := map[string]interface{}{
+		"trace_id":  string(tc.TraceID),
+		"span_id":   string(tc.SpanID),
+		"operation": tc.Operation,
+		"duration_ms": float64(time.Since(tc.StartTime)) / float64(time.Millisecond),
+	}
+	
+	if tc.ParentID != "" {
+		fields["parent_span_id"] = string(tc.ParentID)
+	}
+	
+	// Add all tags with prefix
+	for k, v := range tc.Tags {
+		fields[fmt.Sprintf("tag_%s", k)] = v
+	}
+	
+	return fields
+}
+
+// GetHTTPHeaders returns HTTP headers for trace propagation
+func (tc *TraceContext) GetHTTPHeaders() map[string]string {
+	return map[string]string{
+		"X-Trace-ID": string(tc.TraceID),
+		"X-Span-ID":  string(tc.SpanID),
+	}
+}
+
+// ParseHTTPHeaders extracts trace context from HTTP headers
+func ParseHTTPHeaders(headers map[string]string) *TraceContext {
+	traceID := TraceID(headers["X-Trace-ID"])
+	spanID := SpanID(headers["X-Span-ID"])
+	
+	if traceID == "" || spanID == "" {
+		return nil
+	}
+	
+	return &TraceContext{
+		TraceID:   traceID,
+		SpanID:    spanID,
+		StartTime: time.Now(),
+		Tags:      make(map[string]string),
+	}
+}
+
+// Enhanced EventFactory with trace correlation
+func (factory *EventFactory) NewTracedEvent(
+	name string,
+	eventType string,
+	traceCtx *TraceContext,
+	args ...Arg,
+) *TracedEvent {
+	baseEvent := factory.NewEvent(name, eventType, args...)
+	return &TracedEvent{
+		NormalEvent: *baseEvent,
+		TraceID:     traceCtx.TraceID,
+		SpanID:      traceCtx.SpanID,
+		ParentID:    traceCtx.ParentID,
+	}
+}
+
+// NewTracedCompleteEvent creates a CompleteEvent with trace correlation
+func (factory *EventFactory) NewTracedCompleteEvent(
+	name string,
+	traceCtx *TraceContext,
+	args ...Arg,
+) *TracedCompleteEvent {
+	baseEvent := factory.NewCompleteEvent(name, args...)
+	return &TracedCompleteEvent{
+		CompleteEvent: *baseEvent,
+		TraceID:       traceCtx.TraceID,
+		SpanID:        traceCtx.SpanID,
+		ParentID:      traceCtx.ParentID,
+	}
+}
+
+// === CONTEXT INTEGRATION ===
+
+type traceContextKey struct{}
+
+var TraceContextKey = &traceContextKey{}
+
+// ContextWithTrace adds trace context to a standard Go context
+func ContextWithTrace(ctx context.Context, traceCtx *TraceContext) context.Context {
+	return context.WithValue(ctx, TraceContextKey, traceCtx)
+}
+
+// TraceFromContext extracts trace context from a Go context
+func TraceFromContext(ctx context.Context) (*TraceContext, bool) {
+	trace, ok := ctx.Value(TraceContextKey).(*TraceContext)
+	return trace, ok
+}
+
+// GetOrCreateTraceFromContext gets trace from context or creates new one
+func GetOrCreateTraceFromContext(ctx context.Context, operation string) (*TraceContext, context.Context) {
+	if trace, ok := TraceFromContext(ctx); ok {
+		return trace, ctx
+	}
+	
+	trace := NewTraceContext(operation)
+	newCtx := ContextWithTrace(ctx, trace)
+	return trace, newCtx
+}
+
+// === SUBMISSION-SPECIFIC TRACING ===
+
+// SubmissionTracer provides tracing specific to omegaup submissions
+type SubmissionTracer struct {
+	traceCtx *TraceContext
+	factory  *EventFactory
+}
+
+// NewSubmissionTracer creates a tracer for a specific submission
+func NewSubmissionTracer(submissionID int64, userID int64, problemAlias string) *SubmissionTracer {
+	traceCtx := NewTraceContext("submission_processing")
+	traceCtx.AddTag("submission_id", fmt.Sprintf("%d", submissionID))
+	traceCtx.AddTag("user_id", fmt.Sprintf("%d", userID))
+	traceCtx.AddTag("problem", problemAlias)
+	
+	factory := NewEventFactory("omegaup-grader", "submission-processor")
+	
+	return &SubmissionTracer{
+		traceCtx: traceCtx,
+		factory:  factory,
+	}
+}
+
+// TraceContext returns the trace context
+func (st *SubmissionTracer) TraceContext() *TraceContext {
+	return st.traceCtx
+}
+
+// TracePhase traces a specific phase of submission processing
+func (st *SubmissionTracer) TracePhase(phase string) *TracedCompleteEvent {
+	childSpan := st.traceCtx.NewChildSpan(phase)
+	childSpan.AddTag("phase", phase)
+	
+	event := st.factory.NewTracedCompleteEvent(phase, childSpan)
+	return event
+}
+
+// === LOGGING INTEGRATION ===
+
+// CorrelatedLogger wraps logging with trace correlation
+type CorrelatedLogger struct {
+	traceCtx *TraceContext
+}
+
+// NewCorrelatedLogger creates a logger with trace correlation
+func NewCorrelatedLogger(traceCtx *TraceContext) *CorrelatedLogger {
+	return &CorrelatedLogger{traceCtx: traceCtx}
+}
+
+// Info logs an info message with trace correlation
+func (cl *CorrelatedLogger) Info(message string, keysAndValues ...interface{}) {
+	fields := cl.traceCtx.LogFields()
+	fields["level"] = "INFO"
+	fields["message"] = message
+	
+	// Add additional key-value pairs
+	for i := 0; i < len(keysAndValues)-1; i += 2 {
+		if key, ok := keysAndValues[i].(string); ok {
+			fields[key] = keysAndValues[i+1]
+		}
+	}
+	
+	// In production, send to your logging system
+	fmt.Printf("trace_id=%s span_id=%s %s %+v\n", 
+		cl.traceCtx.TraceID, cl.traceCtx.SpanID, message, fields)
+}
+
+// Error logs an error message with trace correlation
+func (cl *CorrelatedLogger) Error(message string, err error, keysAndValues ...interface{}) {
+	fields := cl.traceCtx.LogFields()
+	fields["level"] = "ERROR"
+	fields["message"] = message
+	fields["error"] = err.Error()
+	
+	// Add additional key-value pairs
+	for i := 0; i < len(keysAndValues)-1; i += 2 {
+		if key, ok := keysAndValues[i].(string); ok {
+			fields[key] = keysAndValues[i+1]
+		}
+	}
+	
+	// In production, send to your logging system
+	fmt.Printf("trace_id=%s span_id=%s ERROR: %s - %v %+v\n", 
+		cl.traceCtx.TraceID, cl.traceCtx.SpanID, message, err, fields)
 }

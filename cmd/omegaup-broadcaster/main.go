@@ -110,30 +110,43 @@ func updateScoreboardForContest(
 	contestAlias string,
 ) {
 	ctx.Log.Info("Requesting scoreboard update", "contest", contestAlias)
-	resp, err := client.PostForm(
-		updateScoreboardURL.String(),
-		url.Values{
-			"token": {ctx.Config.Broadcaster.ScoreboardUpdateSecret},
-			"alias": {contestAlias},
+	
+	config := common.DefaultHTTPRetryConfig()
+	resp, err := common.RetryHTTPRequest(
+		ctx.Log,
+		func() (*http.Response, error) {
+			return client.PostForm(
+				updateScoreboardURL.String(),
+				url.Values{
+					"token": {ctx.Config.Broadcaster.ScoreboardUpdateSecret},
+					"alias": {contestAlias},
+				},
+			)
 		},
+		config,
+		"scoreboard update",
 	)
+	
 	if err != nil {
 		ctx.Log.Error(
-			"Error requesting scoreboard update",
+			"Error requesting scoreboard update after retries",
 			"contest", contestAlias,
 			"err", err,
 		)
 		return
 	}
 	defer resp.Body.Close()
-
+	
 	if resp.StatusCode != 200 {
 		ctx.Log.Error(
 			"Failed to request scoreboard update",
 			"contest", contestAlias,
 			"status code", resp.StatusCode,
 		)
+		return
 	}
+	
+	ctx.Log.Debug("Scoreboard update successful", "contest", contestAlias)
 }
 
 func updateScoreboardLoop(
@@ -219,7 +232,9 @@ func main() {
 	b := broadcaster.NewBroadcaster(ctx, &PrometheusMetrics{})
 	contestChan := make(chan string, 1)
 
-	client := http.Client{}
+	client := http.Client{
+		Timeout: 30 * time.Second,
+	}
 
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", promhttp.Handler())

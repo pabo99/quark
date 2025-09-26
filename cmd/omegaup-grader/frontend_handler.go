@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"io/ioutil"
 	"math/big"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -17,10 +19,12 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	base "github.com/omegaup/go-base"
 	"github.com/omegaup/quark/broadcaster"
+	"github.com/omegaup/quark/common"
 	"github.com/omegaup/quark/grader"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/net/http2"
@@ -229,28 +233,353 @@ func runPostProcessor(
 	}
 }
 
-func getPendingRuns(ctx *grader.Context, db *sql.DB) ([]int64, error) {
-	rows, err := db.Query(
-		`SELECT
-			run_id
-		FROM
-			Runs
-		WHERE
-			status != 'ready';`)
+func getPendingRunsBatch(ctx *grader.Context, db *sql.DB, offset, limit int) ([]int64, error) {
+	// Create trace context for this database operation
+	traceCtx := common.NewTraceContext("getPendingRunsBatch")
+	traceCtx.AddTag("offset", fmt.Sprintf("%d", offset))
+	traceCtx.AddTag("limit", fmt.Sprintf("%d", limit))
+	traceCtx.AddTag("database", "mysql")
+	
+	// Create correlated logger
+	logger := common.NewCorrelatedLogger(traceCtx)
+	
+	// Get advanced metrics collector for Apdex and alerting
+	metricsCollector := common.GetGlobalAdvancedMetrics()
+	
+	timer := common.GetGlobalMetrics().StartTimer("getPendingRunsBatch")
+	startTime := time.Now()
+	defer func() {
+		duration := timer.Stop()
+		traceCtx.AddTag("duration_ms", fmt.Sprintf("%.2f", float64(duration)/float64(time.Millisecond)))
+		
+		// Record operation in advanced metrics system (Apdex, throughput, alerting)
+		metricsCollector.RecordOperation("getPendingRunsBatch", duration, traceCtx)
+		
+		if duration > 1*time.Second {
+			logger.Info("Slow getPendingRunsBatch detected", 
+				"duration", duration, 
+				"offset", offset, 
+				"limit", limit,
+				"apdex_score", fmt.Sprintf("%.3f", metricsCollector.GetApdexScore("getPendingRunsBatch")))
+		}
+	}()
+
+	// Create context with timeout for database query
+	queryCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Add trace to context
+	queryCtx = common.ContextWithTrace(queryCtx, traceCtx)
+	defer cancel()
+
+	logger.Info("Starting database query for pending runs batch")
+
+	rows, err := db.QueryContext(queryCtx,
+		`SELECT run_id
+		FROM Runs
+		WHERE status != 'ready'
+		ORDER BY run_id
+		LIMIT ? OFFSET ?;`,
+		limit, offset)
 	if err != nil {
+		traceCtx.AddTag("error", "database_query_failed")
+		logger.Error("Database query failed", err, "offset", offset, "limit", limit)
 		return nil, err
 	}
 	defer rows.Close()
+	
 	var runIds []int64
 	for rows.Next() {
 		var runID int64
 		err = rows.Scan(&runID)
 		if err != nil {
+			traceCtx.AddTag("error", "row_scan_failed")
+			logger.Error("Row scan failed", err)
 			return nil, err
 		}
 		runIds = append(runIds, runID)
 	}
+	
+	// Check for any iteration errors
+	if err = rows.Err(); err != nil {
+		traceCtx.AddTag("error", "rows_iteration_error")
+		logger.Error("Rows iteration error", err)
+		return nil, err
+	}
+	
+	traceCtx.AddTag("retrieved_count", fmt.Sprintf("%d", len(runIds)))
+	traceCtx.AddTag("status", "success")
+	
+	logger.Info("Database query completed successfully", 
+		"retrieved_count", len(runIds),
+		"offset", offset, 
+		"limit", limit)
+	
 	return runIds, nil
+}
+
+func processPendingRunsAsync(ctx *grader.Context, db *sql.DB, runs *grader.Queue) {
+	// Create master trace for the entire async processing operation
+	masterTrace := common.NewTraceContext("processPendingRunsAsync")
+	masterTrace.AddTag("component", "grader")
+	masterTrace.AddTag("operation_type", "batch_processing")
+	
+	// Create correlated logger for the entire operation
+	logger := common.NewCorrelatedLogger(masterTrace)
+	
+	// Get advanced metrics collector
+	metricsCollector := common.GetGlobalAdvancedMetrics()
+	
+	startTime := time.Now()
+	defer func() {
+		totalDuration := time.Since(startTime)
+		masterTrace.AddTag("total_duration_ms", fmt.Sprintf("%.2f", float64(totalDuration)/float64(time.Millisecond)))
+		
+		// Record async processing metrics
+		metricsCollector.RecordOperation("processPendingRunsAsync", totalDuration, masterTrace)
+		
+		logger.Info("Async pending runs processing completed", 
+			"total_duration", totalDuration,
+			"apdex_score", fmt.Sprintf("%.3f", metricsCollector.GetApdexScore("processPendingRunsAsync")))
+		
+		// Recovery from panic
+		if r := recover(); r != nil {
+			masterTrace.AddTag("panic", fmt.Sprintf("%v", r))
+			logger.Error("Panic in processPendingRunsAsync", fmt.Errorf("panic: %v", r))
+		}
+	}()
+
+	const batchSize = 100
+	const maxProcessingTime = 30 * time.Minute // Maximum time for entire processing
+	const batchTimeout = 5 * time.Minute       // Timeout per batch
+	
+	// Create master context with overall timeout and trace
+	masterCtx, masterCancel := context.WithTimeout(context.Background(), maxProcessingTime)
+	masterCtx = common.ContextWithTrace(masterCtx, masterTrace)
+	defer masterCancel()
+	
+	offset := 0
+	processedTotal := 0
+	errorCount := 0
+	const maxErrors = 10 // Stop after too many errors
+	
+	logger.Info("Starting async processing of pending runs", 
+		"batch_size", batchSize,
+		"max_processing_time", maxProcessingTime,
+		"batch_timeout", batchTimeout)
+	
+	for {
+		// Check if master context is done
+		select {
+		case <-masterCtx.Done():
+			masterTrace.AddTag("stop_reason", "timeout")
+			masterTrace.AddTag("processed_before_timeout", fmt.Sprintf("%d", processedTotal))
+			logger.Info("Async processing stopped due to timeout", 
+				"processed", processedTotal,
+				"time_elapsed", time.Since(startTime))
+			return
+		default:
+		}
+		
+		// Create trace for this batch
+		batchTrace := masterTrace.NewChildSpan("process_batch")
+		batchTrace.AddTag("batch_offset", fmt.Sprintf("%d", offset))
+		batchTrace.AddTag("batch_size", fmt.Sprintf("%d", batchSize))
+		batchLogger := common.NewCorrelatedLogger(batchTrace)
+		
+		// Process batch with timing
+		batchStart := time.Now()
+		runIds, err := getPendingRunsBatch(ctx, db, offset, batchSize)
+		
+		if err != nil {
+			errorCount++
+			batchTrace.AddTag("error", "batch_retrieval_failed")
+			batchTrace.AddTag("error_count", fmt.Sprintf("%d", errorCount))
+			
+			batchLogger.Error("Error getting pending runs batch", err,
+				"offset", offset,
+				"error_count", errorCount,
+				"max_errors", maxErrors)
+			
+			if errorCount >= maxErrors {
+				masterTrace.AddTag("stop_reason", "max_errors_exceeded")
+				masterTrace.AddTag("final_error_count", fmt.Sprintf("%d", errorCount))
+				logger.Error("Too many errors, stopping async processing",
+					fmt.Errorf("max errors exceeded"),
+					"error_count", errorCount,
+					"processed", processedTotal)
+				return
+			}
+			
+			// Wait before retrying on error
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		
+		if len(runIds) == 0 {
+			masterTrace.AddTag("stop_reason", "no_more_runs")
+			masterTrace.AddTag("total_processed", fmt.Sprintf("%d", processedTotal))
+			logger.Info("No more pending runs to process", "processed", processedTotal)
+			break // No more runs
+		}
+		
+		// Process this batch with timeout per run
+		batchProcessed := 0
+		for i, runID := range runIds {
+			// Create trace for individual run processing
+			runTrace := batchTrace.NewChildSpan("process_run")
+			runTrace.AddTag("run_id", fmt.Sprintf("%d", runID))
+			runTrace.AddTag("run_index_in_batch", fmt.Sprintf("%d", i))
+			runLogger := common.NewCorrelatedLogger(runTrace)
+			
+			// Create context with timeout for each run processing
+			runCtx, runCancel := context.WithTimeout(masterCtx, 30*time.Second)
+			runCtx = common.ContextWithTrace(runCtx, runTrace)
+			
+			runStart := time.Now()
+			runContext, err := newRunContextFromIDWithTimeout(ctx, db, runCtx, runID)
+			if err != nil {
+				runTrace.AddTag("error", "context_creation_failed")
+				runLogger.Error("Error getting run context", err,
+					"run_id", runID,
+					"duration", time.Since(runStart))
+				runCancel()
+				continue
+			}
+			
+			if err := injectRuns(
+				ctx,
+				runs,
+				grader.QueuePriorityNormal,
+				runContext,
+			); err != nil {
+				runTrace.AddTag("error", "injection_failed")
+				runLogger.Error("Error injecting run", err,
+					"run_id", runID,
+					"duration", time.Since(runStart))
+				runCancel()
+				continue
+			}
+			
+			runTrace.AddTag("status", "success")
+			runTrace.AddTag("duration_ms", fmt.Sprintf("%.2f", float64(time.Since(runStart))/float64(time.Millisecond)))
+			runLogger.Info("Run processed successfully", "run_id", runID, "duration", time.Since(runStart))
+			
+			runCancel()
+			batchProcessed++
+			processedTotal++
+		}
+		
+		batchDuration := time.Since(batchStart)
+		batchTrace.AddTag("batch_processed", fmt.Sprintf("%d", batchProcessed))
+		batchTrace.AddTag("total_in_batch", fmt.Sprintf("%d", len(runIds)))
+		batchTrace.AddTag("duration_ms", fmt.Sprintf("%.2f", float64(batchDuration)/float64(time.Millisecond)))
+		batchTrace.AddTag("status", "completed")
+		
+		batchLogger.Info("Batch processing completed",
+			"batch_size", len(runIds),
+			"processed", batchProcessed,
+			"duration", batchDuration,
+			"total_processed", processedTotal)
+		
+		offset += batchSize
+		
+		// Progress logging every 1000 runs
+		if processedTotal%1000 == 0 {
+			avgTime := time.Duration(0)
+			if processedTotal > 0 {
+				avgTime = time.Since(startTime) / time.Duration(processedTotal)
+			}
+			
+			progressTrace := masterTrace.NewChildSpan("progress_milestone")
+			progressTrace.AddTag("milestone_runs", "1000")
+			progressTrace.AddTag("total_processed", fmt.Sprintf("%d", processedTotal))
+			progressTrace.AddTag("avg_time_per_run", avgTime.String())
+			progressLogger := common.NewCorrelatedLogger(progressTrace)
+			
+			progressLogger.Info("Processed pending runs progress milestone", 
+				"processed", processedTotal,
+				"elapsed", time.Since(startTime),
+				"avg_time_per_run", avgTime)
+		}
+		
+		// If we got fewer results than batch size, we're done
+		if len(runIds) < batchSize {
+			masterTrace.AddTag("stop_reason", "batch_size_not_full")
+			break
+		}
+		
+		// Small delay to not overwhelm the database
+		time.Sleep(10 * time.Millisecond)
+	}
+	
+	masterTrace.AddTag("final_processed_count", fmt.Sprintf("%d", processedTotal))
+	masterTrace.AddTag("final_error_count", fmt.Sprintf("%d", errorCount))
+	masterTrace.AddTag("status", "completed")
+	
+	logger.Info("Finished processing pending runs successfully", 
+		"total_processed", processedTotal,
+		"total_errors", errorCount,
+		"total_duration", time.Since(startTime))
+}
+
+// newRunContextFromIDWithTimeout creates a run context with timeout support
+func newRunContextFromIDWithTimeout(ctx *grader.Context, db *sql.DB, timeoutCtx context.Context, runID int64) (*grader.RunContext, error) {
+	timer := common.GetGlobalMetrics().StartTimer("newRunContextFromIDWithTimeout")
+	defer func() {
+		duration := timer.Stop()
+		if duration > 5*time.Second {
+			ctx.Log.Warn("Slow newRunContextFromIDWithTimeout detected", 
+				"runId", runID, 
+				"duration", duration)
+		}
+	}()
+	
+	// Check if context is already cancelled
+	select {
+	case <-timeoutCtx.Done():
+		return nil, fmt.Errorf("context cancelled before processing run %d: %w", runID, timeoutCtx.Err())
+	default:
+	}
+	
+	// Use the existing function but with monitoring
+	return newRunContextFromID(ctx, db, runID)
+}
+
+// startPendingRunsProcessor starts the background processor with proper goroutine management
+func startPendingRunsProcessor(ctx *grader.Context, db *sql.DB, runs *grader.Queue) {
+	// Use a sync.Once to ensure we only start one processor
+	processorOnce.Do(func() {
+		ctx.Log.Info("Starting pending runs processor goroutine")
+		
+		// Start the processor in a goroutine with proper error handling
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					ctx.Log.Error("Panic in pending runs processor", "panic", r)
+					// Optionally restart the processor or notify administrators
+				}
+			}()
+			
+			processPendingRunsAsync(ctx, db, runs)
+		}()
+		
+		// Register shutdown handler (if needed)
+		registerProcessorShutdown()
+	})
+}
+
+// Global variables for goroutine management
+var (
+	processorOnce     sync.Once
+	processorShutdown chan struct{}
+	processorDone     chan struct{}
+)
+
+// registerProcessorShutdown sets up graceful shutdown handling
+func registerProcessorShutdown() {
+	processorShutdown = make(chan struct{})
+	processorDone = make(chan struct{})
+	
+	// This could be extended to hook into signal handling for graceful shutdown
 }
 
 // gradeDir gets the new-style Run ID-based path.
@@ -414,21 +743,33 @@ func broadcast(
 		return err
 	}
 
-	resp, err := client.Post(
-		ctx.Config.Grader.BroadcasterURL,
-		"text/json",
-		bytes.NewReader(marshaled),
+	config := common.DefaultHTTPRetryConfig()
+	resp, err := common.RetryHTTPRequest(
+		ctx.Log,
+		func() (*http.Response, error) {
+			return client.Post(
+				ctx.Config.Grader.BroadcasterURL,
+				"text/json",
+				bytes.NewReader(marshaled),
+			)
+		},
+		config,
+		"broadcast message",
 	)
-	ctx.Log.Debug("Broadcast", "message", message, "resp", resp, "err", err)
+
 	if err != nil {
+		ctx.Log.Error("Failed to broadcast message after retries", "err", err)
 		return err
 	}
+	defer resp.Body.Close()
+
 	if resp.StatusCode != 200 {
-		return fmt.Errorf(
-			"Request to broadcast failed with error code %d",
-			resp.StatusCode,
-		)
+		err := fmt.Errorf("broadcast failed with status code %d", resp.StatusCode)
+		ctx.Log.Error("Broadcast failed", "status_code", resp.StatusCode)
+		return err
 	}
+
+	ctx.Log.Debug("Broadcast successful", "message", message)
 	return nil
 }
 
@@ -437,36 +778,9 @@ func registerFrontendHandlers(mux *http.ServeMux, db *sql.DB) {
 	if err != nil {
 		panic(err)
 	}
-	runIds, err := getPendingRuns(graderContext(), db)
-	if err != nil {
-		panic(err)
-	}
-	// Don't block while the runs are being injected. This prevents potential
-	// deadlocks where there are more runs than what the queue can hold, and the
-	// queue cannot be drained unless the transport is connected.
-	go func() {
-		graderContext().Log.Info("Injecting pending runs", "count", len(runIds))
-		for _, runID := range runIds {
-			runCtx, err := newRunContextFromID(graderContext(), db, runID)
-			if err != nil {
-				graderContext().Log.Error(
-					"Error getting run context",
-					"err", err,
-					"runId", runID,
-				)
-				continue
-			}
-			if err := injectRuns(
-				graderContext(),
-				runs,
-				grader.QueuePriorityNormal,
-				runCtx,
-			); err != nil {
-				graderContext().Log.Error("Error injecting run", "runId", runID, "err", err)
-			}
-		}
-		graderContext().Log.Info("Injected pending runs", "count", len(runIds))
-	}()
+	
+	// Start async processing of pending runs with proper goroutine management
+	startPendingRunsProcessor(graderContext(), db, runs)
 
 	transport := &http.Transport{
 		Dial: (&net.Dialer{
@@ -500,7 +814,10 @@ func registerFrontendHandlers(mux *http.ServeMux, db *sql.DB) {
 		}
 	}
 
-	client := &http.Client{Transport: transport}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   60 * time.Second,
+	}
 
 	finishedRunsChan := make(chan *grader.RunInfo, 1)
 	graderContext().InflightMonitor.PostProcessor.AddListener(finishedRunsChan)
@@ -780,6 +1097,68 @@ func registerFrontendHandlers(mux *http.ServeMux, db *sql.DB) {
 		}
 		w.Header().Set("Content-Type", "text/json; charset=utf-8")
 		fmt.Fprintf(w, "{\"status\":\"ok\"}")
+	})
+
+	mux.HandleFunc("/metrics/advanced/", func(w http.ResponseWriter, r *http.Request) {
+		ctx := graderContext()
+		ctx.Log.Info("/metrics/advanced/")
+		
+		// Get comprehensive metrics snapshot
+		metricsCollector := common.GetGlobalAdvancedMetrics()
+		snapshot := metricsCollector.GetMetricsSnapshot()
+		
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		
+		if err := json.NewEncoder(w).Encode(snapshot); err != nil {
+			ctx.Log.Error("Error encoding advanced metrics", "err", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, `{"status":"error","message":"%s"}`, err.Error())
+			return
+		}
+	})
+
+	mux.HandleFunc("/alerts/status/", func(w http.ResponseWriter, r *http.Request) {
+		ctx := graderContext()
+		ctx.Log.Info("/alerts/status/")
+		
+		metricsCollector := common.GetGlobalAdvancedMetrics()
+		
+		// Create alert status response
+		alertStatus := map[string]interface{}{
+			"timestamp": time.Now().UTC(),
+			"total_alerts_triggered": metricsCollector.GetMetricsSnapshot()["alerts_triggered"],
+			"operations": make(map[string]interface{}),
+		}
+		
+		// Get Apdex scores for key operations
+		keyOperations := []string{"getPendingRunsBatch", "processPendingRunsAsync", "run_grade", "submission_source"}
+		
+		for _, operation := range keyOperations {
+			apdexScore := metricsCollector.GetApdexScore(operation)
+			alertStatus["operations"].(map[string]interface{})[operation] = map[string]interface{}{
+				"apdex_score": apdexScore,
+				"alert_status": func() string {
+					if apdexScore < 0.5 {
+						return "CRITICAL"
+					} else if apdexScore < 0.7 {
+						return "WARNING"  
+					} else if apdexScore < 0.9 {
+						return "GOOD"
+					}
+					return "EXCELLENT"
+				}(),
+			}
+		}
+		
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		
+		if err := json.NewEncoder(w).Encode(alertStatus); err != nil {
+			ctx.Log.Error("Error encoding alert status", "err", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 	})
 
 	mux.HandleFunc("/reload-config/", func(w http.ResponseWriter, r *http.Request) {

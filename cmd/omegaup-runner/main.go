@@ -320,7 +320,10 @@ func main() {
 		}
 	}
 
-	client := &http.Client{Transport: transport}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   60 * time.Second,
+	}
 
 	baseURL, err := url.Parse(ctx.Config.Runner.GraderURL)
 	if err != nil {
