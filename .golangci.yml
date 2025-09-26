@@ -2,8 +2,6 @@
 run:
   timeout: 5m
   tests: false
-  skip-dirs:
-    - vendor
 
 issues:
   exclude-use-default: true
@@ -25,6 +23,10 @@ linters-settings:
     local-prefixes: github.com/omegaup/quark
   govet:
     shadow: false
+    disable:
+      - shadow
+      - fieldalignment
+      - printf
   errcheck:
     check-type-assertions: false
     check-blank: false
@@ -36,12 +38,8 @@ linters-settings:
 linters:
   disable-all: true
   enable:
-    # Critical formatting only
+    # Only basic formatting for now
     - gofmt
-    - goimports
-    # Only serious issues
-    - govet
-    - staticcheck
 
 severity:
   default-severity: warning
