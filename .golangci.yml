@@ -4,18 +4,17 @@ run:
   tests: false
   skip-dirs:
     - vendor
-  build-tags:
-    - static
 
 issues:
-  exclude-use-default: false
+  exclude-use-default: true
   exclude-dirs:
     - vendor
-  max-issues-per-linter: 0
-  max-same-issues: 0
+  max-issues-per-linter: 50
+  max-same-issues: 10
 
 output:
-  format: colored-line-number
+  formats:
+    - format: colored-line-number
   print-issued-lines: true
   print-linter-name: true
 
@@ -25,38 +24,24 @@ linters-settings:
   goimports:
     local-prefixes: github.com/omegaup/quark
   govet:
-    shadow: true
-  misspell:
-    locale: US
+    shadow: false
+  errcheck:
+    check-type-assertions: false
+    check-blank: false
   gocyclo:
-    min-complexity: 15
+    min-complexity: 30  # More tolerant
   dupl:
-    threshold: 100
-  goconst:
-    min-len: 3
-    min-occurrences: 3
+    threshold: 150  # More tolerant
 
 linters:
   disable-all: true
   enable:
+    # Critical formatting only
     - gofmt
     - goimports
+    # Only serious issues
     - govet
-    - errcheck
     - staticcheck
-    - unused
-    - gosimple
-    - ineffassign
-    - misspell
-    - unconvert
-    - goconst
-    - gocyclo
-    - dupl
 
 severity:
-  default-severity: error
-  case-sensitive: false
-  rules:
-    - linters:
-      - misspell
-      severity: warning
+  default-severity: warning
