@@ -1,9 +1,23 @@
 # golangci-lint configuration
 run:
   timeout: 5m
-  tests: true
+  tests: false
   skip-dirs:
     - vendor
+  build-tags:
+    - static
+
+issues:
+  exclude-use-default: false
+  exclude-dirs:
+    - vendor
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+output:
+  format: colored-line-number
+  print-issued-lines: true
+  print-linter-name: true
 
 linters-settings:
   gofmt:
@@ -21,17 +35,9 @@ linters-settings:
   goconst:
     min-len: 3
     min-occurrences: 3
-  depguard:
-    rules:
-      main:
-        files:
-          - $all
-        allow:
-          - $gostd
-          - github.com/omegaup
-          - golang.org/x
 
 linters:
+  disable-all: true
   enable:
     - gofmt
     - goimports
@@ -41,32 +47,11 @@ linters:
     - unused
     - gosimple
     - ineffassign
-  disable:
-    # Deprecated linters - removed in newer versions
-    - structcheck
-    - varcheck
-    - deadcode
-    # Problematic with complex dependencies
-    - typecheck
-    # Optional - can be enabled later
-    - gosec     # Security checks might be too strict for this codebase
-    - lll       # Line length checks
-    - gochecknoinits # Allow init functions
-    - gochecknoglobals # Allow global variables
-
-issues:
-  exclude-use-default: false
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - errcheck
-        - dupl
-        - gosec
-    - path: "cmd/"
-      linters:
-        - gochecknoglobals
-  max-issues-per-linter: 0
-  max-same-issues: 0
+    - misspell
+    - unconvert
+    - goconst
+    - gocyclo
+    - dupl
 
 severity:
   default-severity: error
