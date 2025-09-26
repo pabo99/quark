@@ -30,14 +30,6 @@ jobs:
           go-version: ${{ matrix.go }}
         id: go
 
-      - name: Install golangci-lint
-        uses: golangci/golangci-lint-action@v3
-        with:
-          version: latest
-          skip-cache: false
-          skip-pkg-cache: false
-          skip-build-cache: false
-
       - name: Install git2go
         run: |
           export GOPATH="$(go env GOPATH)"
@@ -48,6 +40,14 @@ jobs:
 
       - name: Get dependencies
         run: go get -tags=static -t -v ./...
+
+      - name: Install golangci-lint
+        uses: golangci/golangci-lint-action@v3
+        with:
+          version: latest
+          skip-cache: false
+          skip-pkg-cache: false
+          skip-build-cache: false
 
       - name: Vet
         run: go vet -tags=static -v ./...
