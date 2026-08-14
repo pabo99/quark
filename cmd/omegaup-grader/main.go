@@ -152,6 +152,7 @@ func queueEventsProcessor(events <-chan *grader.QueueEvent) {
 			case grader.QueueEventTypeManagerRemoved:
 				ctx.Metrics.GaugeAdd("grader_queue_total_length", -1)
 				ctx.Metrics.SummaryObserve("grader_queue_delay_seconds", event.Delta.Seconds())
+				ctx.Metrics.SummaryObserve("grader_time_to_verdict_seconds", event.Delta.Seconds())
 			case grader.QueueEventTypeQueueRemoved:
 				switch event.Priority {
 				case grader.QueuePriorityEphemeral:

@@ -179,6 +179,13 @@ var (
 			Name:       "queue_high_delay_seconds",
 			Objectives: map[float64]float64{0.5: 0.05, 0.9: 0.01, 0.99: 0.001},
 		}),
+		"grader_time_to_verdict_seconds": prometheus.NewSummary(prometheus.SummaryOpts{
+			Namespace:  "quark",
+			Subsystem:  "grader",
+			Help:       "End-to-end time from submission enqueue to verdict",
+			Name:       "time_to_verdict_seconds",
+			Objectives: map[float64]float64{0.5: 0.05, 0.9: 0.01, 0.99: 0.001},
+		}),
 	}
 )
 
