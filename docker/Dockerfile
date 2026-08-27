@@ -1,4 +1,4 @@
-FROM ghcr.io/omegaup/omegajail/omegajail-builder-rootfs-runtime:v3.10.0 AS base
+FROM ghcr.io/omegaup/omegajail/omegajail-builder-rootfs-runtime:v3.11.0 AS base
 
 FROM base AS builder
 
@@ -8,23 +8,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Install karel.js in a builder container to avoid leaving a lot of trash in
-# the /root directory.
-RUN mkdir /tmp/karel && \
-    echo '{"dependencies":{"karel":"1.1.0"}}' > /tmp/karel/package.json && \
-    (cd /tmp/karel && /opt/nodejs/bin/npm install) && \
-    mv /tmp/karel/node_modules/* /opt/nodejs/lib/node_modules/ && \
-    rm -rf /tmp/karel
-
 # Install a newer version of the omegajail binary.
 RUN rm -rf /var/lib/omegajail && \
-    curl -sSL https://github.com/omegaup/omegajail/releases/download/v3.10.4/omegajail-focal-distrib-x86_64.tar.xz | tar xJ -C / && \
+    curl -sSL https://github.com/omegaup/omegajail/releases/download/v3.11.2/omegajail-jammy-distrib-x86_64.tar.xz | tar xJ -C / && \
     curl -sL https://github.com/omegaup/libinteractive/releases/download/v2.0.30/libinteractive.jar \
         -o /usr/share/java/libinteractive.jar
 
 FROM base
 
-COPY --from=builder /opt/nodejs/lib/node_modules/ /opt/nodejs/lib/node_modules/
 RUN rm -rf /var/lib/omegajail
 COPY --from=builder /var/lib/omegajail/ /var/lib/omegajail/
 COPY --from=builder /usr/share/java/libinteractive.jar /usr/share/java/libinteractive.jar
