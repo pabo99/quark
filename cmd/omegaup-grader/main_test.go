@@ -40,7 +40,7 @@ func (m *recordingMetrics) findSummaryObservation(name string) (float64, bool) {
 	return 0, false
 }
 
-func TestQueueEventsProcessorObservesTimeToVerdict(t *testing.T) {
+func TestQueueEventsProcessorObservesTimeToVerdictOnManagerRemoved(t *testing.T) {
 	metrics := &recordingMetrics{}
 	globalContext.Store(&grader.Context{
 		Context: common.Context{
@@ -57,17 +57,44 @@ func TestQueueEventsProcessorObservesTimeToVerdict(t *testing.T) {
 
 	queueEventsProcessor(events)
 
-	for _, name := range []string{
-		"grader_queue_delay_seconds",
-		"grader_time_to_verdict_seconds",
-	} {
-		value, ok := metrics.findSummaryObservation(name)
-		if !ok {
-			t.Errorf("missing summary observation for %s", name)
-			continue
-		}
-		if value != 2 {
-			t.Errorf("summary observation for %s = %f, want 2", name, value)
-		}
+	value, ok := metrics.findSummaryObservation("grader_time_to_verdict_seconds")
+	if !ok {
+		t.Fatal("missing summary observation for grader_time_to_verdict_seconds")
+	}
+	if value != 2 {
+		t.Errorf("summary observation for grader_time_to_verdict_seconds = %f, want 2", value)
+	}
+	if _, observed := metrics.findSummaryObservation("grader_queue_delay_seconds"); observed {
+		t.Fatal("grader_queue_delay_seconds must not be observed on ManagerRemoved")
+	}
+}
+
+func TestQueueEventsProcessorObservesQueueDelayOnQueueRemoved(t *testing.T) {
+	metrics := &recordingMetrics{}
+	globalContext.Store(&grader.Context{
+		Context: common.Context{
+			Metrics: metrics,
+		},
+	})
+
+	events := make(chan *grader.QueueEvent, 1)
+	events <- &grader.QueueEvent{
+		Type:     grader.QueueEventTypeQueueRemoved,
+		Priority: grader.QueuePriorityNormal,
+		Delta:    2 * time.Second,
+	}
+	close(events)
+
+	queueEventsProcessor(events)
+
+	value, ok := metrics.findSummaryObservation("grader_queue_delay_seconds")
+	if !ok {
+		t.Fatal("missing summary observation for grader_queue_delay_seconds")
+	}
+	if value != 2 {
+		t.Errorf("summary observation for grader_queue_delay_seconds = %f, want 2", value)
+	}
+	if _, observed := metrics.findSummaryObservation("grader_time_to_verdict_seconds"); observed {
+		t.Fatal("grader_time_to_verdict_seconds must not be observed on QueueRemoved")
 	}
 }

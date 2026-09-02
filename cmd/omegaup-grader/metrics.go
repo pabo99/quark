@@ -147,7 +147,7 @@ var (
 		"grader_queue_delay_seconds": prometheus.NewSummary(prometheus.SummaryOpts{
 			Namespace:  "quark",
 			Subsystem:  "grader",
-			Help:       "The duration of a run in any queue",
+			Help:       "Time a run waited in queue before a runner picked it up",
 			Name:       "queue_delay_seconds",
 			Objectives: map[float64]float64{0.5: 0.05, 0.9: 0.01, 0.99: 0.001},
 		}),

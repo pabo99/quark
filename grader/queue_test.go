@@ -1,11 +1,13 @@
 package grader
 
 import (
-	"github.com/omegaup/quark/common"
 	"math/big"
 	"os"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/omegaup/quark/common"
 )
 
 var (
@@ -309,6 +311,92 @@ func TestPostProcessor(t *testing.T) {
 		}
 		if listeners[i].processed != numProcessed {
 			t.Fatalf("listeners[%d].processed == %d, want %d", i, listeners[i].processed, numProcessed)
+		}
+	}
+}
+
+func waitForQueueEvent(t *testing.T, events <-chan *QueueEvent, typ QueueEventType) *QueueEvent {
+	t.Helper()
+	timeout := time.After(2 * time.Second)
+	for {
+		select {
+		case ev, ok := <-events:
+			if !ok {
+				t.Fatalf("event channel closed while waiting for %v", typ)
+			}
+			if ev.Type == typ {
+				return ev
+			}
+		case <-timeout:
+			t.Fatalf("timed out waiting for event type %v", typ)
+		}
+	}
+}
+
+func TestEnqueueSetsQueueTime(t *testing.T) {
+	ctx, err := newGraderContext(t)
+	if err != nil {
+		t.Fatalf("GraderContext creation failed with %q", err)
+	}
+	defer ctx.Close()
+	if !ctx.Config.Runner.PreserveFiles {
+		defer os.RemoveAll(ctx.Config.Grader.RuntimePath)
+	}
+
+	queue, err := ctx.QueueManager.Get(DefaultQueueName)
+	if err != nil {
+		t.Fatalf("default queue not found")
+	}
+
+	runInfo := addRun(t, ctx, queue, QueuePriorityEphemeral)
+	if runInfo.QueueTime.IsZero() {
+		t.Fatal("QueueTime was not set when enqueueing an ephemeral run")
+	}
+}
+
+func TestGetRunEmitsQueueRemovedUsingQueueTime(t *testing.T) {
+	ctx, err := newGraderContext(t)
+	if err != nil {
+		t.Fatalf("GraderContext creation failed with %q", err)
+	}
+	defer ctx.Close()
+	if !ctx.Config.Runner.PreserveFiles {
+		defer os.RemoveAll(ctx.Config.Grader.RuntimePath)
+	}
+
+	queue, err := ctx.QueueManager.Get(DefaultQueueName)
+	if err != nil {
+		t.Fatalf("default queue not found")
+	}
+
+	events := make(chan *QueueEvent, 16)
+	ctx.QueueManager.AddEventListener(events)
+
+	runInfo := addRun(t, ctx, queue, QueuePriorityNormal)
+	runInfo.QueueTime = time.Now().Add(-250 * time.Millisecond)
+
+	closeNotifier := make(chan bool, 1)
+	runCtx, _, ok := queue.GetRun("test", ctx.InflightMonitor, closeNotifier)
+	if !ok {
+		t.Fatal("expected a run from the queue")
+	}
+
+	removed := waitForQueueEvent(t, events, QueueEventTypeQueueRemoved)
+	if removed.Delta < 200*time.Millisecond {
+		t.Fatalf("QueueRemoved delta = %v, want at least 200ms of queue wait", removed.Delta)
+	}
+
+	ctx.InflightMonitor.Remove(runCtx.RunInfo.Run.AttemptID)
+
+	timeout := time.After(200 * time.Millisecond)
+	for {
+		select {
+		case ev := <-events:
+			if ev.Type == QueueEventTypeQueueRemoved {
+				t.Fatal("InflightMonitor.Remove emitted QueueRemoved; that event is dequeue wait time")
+			}
+		case <-timeout:
+			return
 		}
 	}
 }

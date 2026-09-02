@@ -544,6 +544,11 @@ func (queue *Queue) GetRun(
 	for i := range queue.runs {
 		select {
 		case runCtx := <-queue.runs[i]:
+			queue.queueManager.AddEvent(&QueueEvent{
+				Delta:    time.Now().Sub(runCtx.RunInfo.QueueTime),
+				Priority: runCtx.RunInfo.Priority,
+				Type:     QueueEventTypeQueueRemoved,
+			})
 			inflight := monitor.Add(runCtx, runner)
 			return runCtx, inflight.timeout, true
 		default:
@@ -641,9 +646,9 @@ func (queue *Queue) enqueueBlocking(runCtx *RunContext) {
 		panic("null RunContext")
 	}
 	runCtx.queue = queue
+	runCtx.RunInfo.QueueTime = time.Now()
 	queue.runs[runCtx.RunInfo.Priority] <- runCtx
 	queue.ready <- struct{}{}
-	runCtx.RunInfo.QueueTime = time.Now()
 	queue.queueManager.AddEvent(&QueueEvent{
 		Delta:    time.Now().Sub(runCtx.RunInfo.CreationTime),
 		Priority: runCtx.RunInfo.Priority,
@@ -657,6 +662,7 @@ func (queue *Queue) enqueue(runCtx *RunContext, priority QueuePriority) bool {
 		panic("null RunContext")
 	}
 	runCtx.queue = queue
+	runCtx.RunInfo.QueueTime = time.Now()
 	select {
 	case queue.runs[priority] <- runCtx:
 		queue.ready <- struct{}{}
@@ -800,11 +806,6 @@ func (monitor *InflightMonitor) Remove(attemptID uint64) {
 	defer monitor.Unlock()
 	inflight, ok := monitor.mapping[attemptID]
 	if ok {
-		inflight.runCtx.queueManager.AddEvent(&QueueEvent{
-			Delta:    time.Now().Sub(inflight.runCtx.RunInfo.QueueTime),
-			Priority: inflight.runCtx.RunInfo.Priority,
-			Type:     QueueEventTypeQueueRemoved,
-		})
 		inflight.runCtx.monitor = nil
 		select {
 		// Try to signal that the run has been connected.
